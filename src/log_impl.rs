@@ -13,6 +13,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "size-limited")]
+use std::{
+    fs::OpenOptions,
+    path::{Path, PathBuf},
+};
+
 use log::{self, Log};
 
 use crate::{Filter, Formatter};
@@ -76,6 +82,8 @@ pub enum Output {
     Writer(Writer),
     #[cfg(feature = "date-based")]
     DateBased(DateBased),
+    #[cfg(feature = "size-limited")]
+    SizeLimited(SizeLimited),
     #[cfg(all(not(windows), feature = "reopen-03"))]
     Reopen(Reopen),
 }
@@ -229,6 +237,128 @@ impl DateBasedConfig {
     }
 }
 
+/// File logger with a size-limitation.
+#[derive(Debug)]
+#[cfg(feature = "size-limited")]
+pub struct SizeLimited {
+    pub config: SizeLimitedConfig,
+    pub state: Mutex<SizeLimitedState>,
+}
+
+#[derive(Debug)]
+#[cfg(feature = "size-limited")]
+pub struct SizeLimitedConfig {
+    pub line_sep: Cow<'static, str>,
+    /// This is a Path not an str so it can hold invalid UTF8 paths correctly.
+    pub file_path: PathBuf,
+    pub file_size_limit: u64,
+    pub file_num_limit: usize,
+}
+
+#[cfg(feature = "size-limited")]
+impl SizeLimitedConfig {
+    pub fn new(
+        line_sep: Cow<'static, str>,
+        file_path: PathBuf,
+        file_size_limit: u64,
+        file_num_limit: usize,
+    ) -> Self {
+        SizeLimitedConfig {
+            line_sep,
+            file_path,
+            file_size_limit,
+            file_num_limit,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[cfg(feature = "size-limited")]
+pub struct SizeLimitedState {
+    pub estimated_file_size: u64,
+    pub file_stream: Option<BufWriter<fs::File>>,
+}
+
+#[cfg(feature = "size-limited")]
+impl SizeLimitedState {
+    pub fn new(file: Option<fs::File>) -> Self {
+        match file {
+            Some(f) => SizeLimitedState {
+                estimated_file_size: Self::query_file_size(&f),
+                file_stream: Some(BufWriter::new(f)),
+            },
+            None => SizeLimitedState {
+                estimated_file_size: 0,
+                file_stream: None,
+            },
+        }
+    }
+
+    pub fn rotate_file(&mut self, file_num_limit: usize, file_path: &Path) -> io::Result<()> {
+        if let Some(mut old) = self.file_stream.take() {
+            let _ = old.flush();
+        }
+
+        let backups: Vec<PathBuf> = (1..file_num_limit)
+            .collect::<Vec<usize>>()
+            .iter()
+            .map(|id| file_path.with_extension(format!("{}.log", id)))
+            .collect();
+
+        // do rotation
+        for i in (1..backups.len()).rev() {
+            Self::move_log_file(&backups[i - 1], &backups[i])?;
+        }
+        Self::move_log_file(file_path, &backups[0])?;
+
+        // create new file
+        let new_file = self.open_log_file(file_path)?;
+        self.file_stream = Some(BufWriter::new(new_file));
+
+        Ok(())
+    }
+
+    fn move_log_file(from: &Path, to: &Path) -> io::Result<()> {
+        if let Err(e) = fs::rename(from, to) {
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    fn query_file_size(file: &fs::File) -> u64 {
+        if let Ok(metadata) = file.metadata() {
+            metadata.len()
+        } else {
+            0
+        }
+    }
+
+    fn open_log_file(&mut self, path: &Path) -> io::Result<fs::File> {
+        match OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(new_file) => {
+                self.estimated_file_size = Self::query_file_size(&new_file);
+                Ok(new_file)
+            }
+            Err(e) => {
+                self.estimated_file_size = 0;
+                Err(e)
+            }
+        }
+    }
+
+    pub fn open_current_log_file(&mut self, path: &Path) -> io::Result<()> {
+        self.file_stream = Some(self.open_log_file(path).map(BufWriter::new)?);
+        Ok(())
+    }
+}
+
 impl From<Vec<(Cow<'static, str>, log::LevelFilter)>> for LevelConfiguration {
     fn from(mut levels: Vec<(Cow<'static, str>, log::LevelFilter)>) -> Self {
         // Benchmarked separately: https://gist.github.com/daboross/976978d8200caf86e02acb6805961195
@@ -314,6 +444,8 @@ impl Log for Output {
             Output::Writer(ref s) => s.enabled(metadata),
             #[cfg(feature = "date-based")]
             Output::DateBased(ref s) => s.enabled(metadata),
+            #[cfg(feature = "size-limited")]
+            Output::SizeLimited(ref s) => s.enabled(metadata),
             #[cfg(all(not(windows), feature = "reopen-03"))]
             Output::Reopen(ref s) => s.enabled(metadata),
         }
@@ -339,6 +471,8 @@ impl Log for Output {
             Output::Writer(ref s) => s.log(record),
             #[cfg(feature = "date-based")]
             Output::DateBased(ref s) => s.log(record),
+            #[cfg(feature = "size-limited")]
+            Output::SizeLimited(ref s) => s.log(record),
             #[cfg(all(not(windows), feature = "reopen-03"))]
             Output::Reopen(ref s) => s.log(record),
         }
@@ -364,6 +498,8 @@ impl Log for Output {
             Output::Writer(ref s) => s.flush(),
             #[cfg(feature = "date-based")]
             Output::DateBased(ref s) => s.flush(),
+            #[cfg(feature = "size-limited")]
+            Output::SizeLimited(ref s) => s.flush(),
             #[cfg(all(not(windows), feature = "reopen-03"))]
             Output::Reopen(ref s) => s.flush(),
         }
@@ -712,6 +848,57 @@ impl Log for DateBased {
 
             writer.flush()?;
 
+            Ok(())
+        });
+    }
+
+    fn flush(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(stream) = &mut state.file_stream {
+            let _ = stream.flush();
+        }
+    }
+}
+
+#[cfg(feature = "size-limited")]
+impl Log for SizeLimited {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        fallback_on_error(record, |record| {
+            // Formatting first prevents deadlocks on file-logging,
+            // when the process of formatting itself is logged.
+            // note: this is only ever needed if some Debug, Display, or other
+            // formatting trait itself is logging.
+            #[cfg(feature = "meta-logging-in-format")]
+            let msg = format!("{}{}", record.args(), self.config.line_sep);
+
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+            if state.file_stream.is_none() {
+                state.open_current_log_file(&self.config.file_path)?;
+            }
+
+            // check if log needs to be rotated
+            let size_limit = self.config.file_size_limit;
+            if state.estimated_file_size >= size_limit {
+                state.rotate_file(self.config.file_num_limit, &self.config.file_path)?;
+            }
+
+            #[cfg(feature = "meta-logging-in-format")]
+            let output = format!("{}", msg);
+            #[cfg(not(feature = "meta-logging-in-format"))]
+            let output = format!("{}{}", record.args(), self.config.line_sep);
+
+            // either just initialized writer above, or already errored out.
+            let writer = state.file_stream.as_mut().unwrap();
+            let n = writer.write(output.as_bytes())?;
+            writer.flush()?;
+
+            state.estimated_file_size += n as u64;
             Ok(())
         });
     }

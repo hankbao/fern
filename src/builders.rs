@@ -5,7 +5,7 @@ use std::{
     sync::{mpsc::Sender, Arc, Mutex},
 };
 
-#[cfg(feature = "date-based")]
+#[cfg(any(feature = "date-based", feature = "size-limited"))]
 use std::path::{Path, PathBuf};
 
 #[cfg(all(not(windows), feature = "syslog-4"))]
@@ -17,6 +17,9 @@ use crate::{log_impl, Filter, FormatCallback, Formatter};
 
 #[cfg(feature = "date-based")]
 use crate::log_impl::DateBasedState;
+
+#[cfg(feature = "size-limited")]
+use crate::log_impl::SizeLimitedState;
 
 #[cfg(all(not(windows), feature = "syslog-4"))]
 use crate::{Syslog4Rfc3164Logger, Syslog4Rfc5424Logger};
@@ -537,6 +540,22 @@ impl Dispatch {
                         state: Mutex::new(DateBasedState::new(computed_suffix, initial_file)),
                     }))
                 }
+                #[cfg(feature = "size-limited")]
+                OutputInner::SizeLimited { config } => {
+                    max_child_level = log::LevelFilter::Trace;
+
+                    let config = log_impl::SizeLimitedConfig::new(
+                        config.line_sep,
+                        config.file_path,
+                        config.file_size_limit,
+                        config.file_num_limit,
+                    );
+
+                    Some(log_impl::Output::SizeLimited(log_impl::SizeLimited {
+                        config,
+                        state: Mutex::new(SizeLimitedState::new(None)),
+                    }))
+                }
             })
             .collect();
 
@@ -674,6 +693,8 @@ enum OutputInner {
     /// File logger with custom date and timestamp suffix in file name.
     #[cfg(feature = "date-based")]
     DateBased { config: DateBased },
+    #[cfg(feature = "size-limited")]
+    SizeLimited { config: SizeLimited },
 }
 
 /// Logger which will panic whenever anything is logged. The panic
@@ -1274,6 +1295,11 @@ impl fmt::Debug for OutputInner {
                 .debug_struct("Output::DateBased")
                 .field("config", config)
                 .finish(),
+            #[cfg(feature = "size-limited")]
+            OutputInner::SizeLimited { ref config } => f
+                .debug_struct("Output::SizeLimited")
+                .field("config", config)
+                .finish(),
         }
     }
 }
@@ -1452,5 +1478,57 @@ impl From<DateBased> for Output {
     /// configuration methods on [DateBased] to set line separator and filename.
     fn from(config: DateBased) -> Self {
         Output(OutputInner::DateBased { config })
+    }
+}
+
+/// TODO: doc
+#[derive(Debug)]
+#[cfg(feature = "size-limited")]
+pub struct SizeLimited {
+    file_path: PathBuf,
+    file_size_limit: u64,
+    file_num_limit: usize,
+    line_sep: Cow<'static, str>,
+}
+
+#[cfg(feature = "size-limited")]
+impl SizeLimited {
+    /// TODO: doc
+    pub fn new<T>(file_path: T, file_size_limit: u64, file_num_limit: usize) -> Self
+    where
+        T: AsRef<Path>,
+    {
+        SizeLimited {
+            file_path: file_path.as_ref().to_owned(),
+            file_size_limit,
+            file_num_limit,
+            line_sep: "\n".into(),
+        }
+    }
+
+    /// Changes the line separator this logger will use.
+    ///
+    /// The default line separator is `\n`.
+    ///
+    /// # Examples
+    ///
+    /// Using a windows line separator:
+    ///
+    /// ```
+    /// let log = fern::SizeLimited::new("logs", "%s.log").line_sep("\r\n");
+    /// ```
+    pub fn line_sep<T>(mut self, line_sep: T) -> Self
+    where
+        T: Into<Cow<'static, str>>,
+    {
+        self.line_sep = line_sep.into();
+        self
+    }
+}
+
+#[cfg(feature = "size-limited")]
+impl From<SizeLimited> for Output {
+    fn from(config: SizeLimited) -> Self {
+        Output(OutputInner::SizeLimited { config })
     }
 }
